@@ -2,8 +2,8 @@
 <h1>GenSfM</h1>
 <h3>Generative Structure from Motion with Native 3D Diffusion</h3>
 <p><strong>NeurIPS 2026</strong></p>
-<p>Haobin Duan<sup>1,2,&#42;</sup> · Binbin Huang<sup>1,2,&#42;</sup> · Mochu Xiang<sup>1,2</sup> · Yiqun Zhao<sup>1,2</sup><br>Zibo Zhao<sup>3</sup> · Yi Ma<sup>1,2</sup> · Shenghua Gao<sup>1,2,†</sup></p>
-<p><sup>1</sup> The University of Hong Kong &nbsp; <sup>2</sup> Transengram &nbsp; <sup>3</sup> Tencent<br><sup>&#42;</sup> Equal contribution &nbsp; <sup>†</sup> Corresponding author</p>
+<p>Haobin Duan<sup>1,2,&#42;</sup> · Binbin Huang<sup>1,2,&#42;</sup> · Mochu Xiang<sup>1,2</sup> · Yiqun Zhao<sup>1,2</sup><br>Zibo Zhao<sup>3</sup> · Yi Ma<sup>1,2,4</sup> · Shenghua Gao<sup>1,2,4,†</sup></p>
+<p><sup>1</sup> The University of Hong Kong &nbsp; <sup>2</sup> Transengram &nbsp; <sup>3</sup> Tencent<br><sup>4</sup> Shenzhen Loop Area Institute<br><sup>&#42;</sup> Equal contribution &nbsp; <sup>†</sup> Corresponding author</p>
 <p><a href="https://arxiv.org/abs/2610.35522"><img src="assets/badges/paper.svg" alt="Paper"></a> <a href="https://dotb1ue.github.io/GenSfm/"><img src="assets/badges/project.svg" alt="Project page"></a> <a href="https://huggingface.co/dotblue/GenSfm"><img src="assets/badges/models.svg" alt="Models"></a> <a href="https://dotb1ue.github.io/GenSfm/#video"><img src="assets/badges/video.svg" alt="Video"></a></p>
 <p><strong>A few images. One complete object. Its cameras.</strong></p>
 <a href="https://dotb1ue.github.io/GenSfm/#gallery"><img src="assets/overview.webp" width="960" alt="Four views of a fabric wagon, its textured 3D reconstruction inside a dashed unit cube, and recovered cameras with fading denoising trajectories"></a>
