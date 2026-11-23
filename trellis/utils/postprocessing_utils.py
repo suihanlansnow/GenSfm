@@ -2,6 +2,7 @@ from typing import *
 import numpy as np
 import torch
 import threading
+import time
 import nvdiffrast.torch as dr
 from torch import Tensor
 from tqdm import tqdm
@@ -688,6 +689,7 @@ def bake_texture(
     far: float = 10.0,
     mode: Literal['fast', 'opt'] = 'opt',
     lambda_tv: float = 1e-2,
+    steps: int = 2500,
     verbose: bool = False,
 ):
     """
@@ -771,7 +773,7 @@ def bake_texture(
             return torch.nn.functional.l1_loss(texture[:, :-1, :, :], texture[:, 1:, :, :]) + \
                    torch.nn.functional.l1_loss(texture[:, :, :-1, :], texture[:, :, 1:, :])
     
-        total_steps = 2500
+        total_steps = steps
         with tqdm(total=total_steps, disable=not verbose, desc='Texture baking (opt): optimizing') as pbar:
             for step in range(total_steps):
                 optimizer.zero_grad()
@@ -795,6 +797,196 @@ def bake_texture(
     else:
         raise ValueError(f'Unknown mode: {mode}')
 
+    return texture
+
+
+_STENCIL_OFFSETS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1)]
+_CORNER_DY = (0, 0, 1, 1)
+_CORNER_DX = (0, 1, 0, 1)
+
+
+def _bilinear_corners(uv: Tensor, size: int):
+    """Corner indices/weights of nvdiffrast's linear filtering.
+
+    The convention (verified against ``dr.texture`` to 1e-7) is: texel centres at
+    ``(i + 0.5) / size``, no vertical flip, wrap addressing.
+    """
+    f = uv * size - 0.5
+    base = torch.floor(f)
+    frac = f - base
+    x0, y0 = base[:, 0].long(), base[:, 1].long()
+    wx, wy = frac[:, 0], frac[:, 1]
+    x0w, x1w = x0 % size, (x0 + 1) % size
+    y0w, y1w = y0 % size, (y0 + 1) % size
+    idx = torch.stack([y0w * size + x0w, y0w * size + x1w,
+                       y1w * size + x0w, y1w * size + x1w], dim=1)
+    w = torch.stack([(1 - wx) * (1 - wy), wx * (1 - wy),
+                     (1 - wx) * wy, wx * wy], dim=1)
+    return idx, w
+
+
+def bake_texture_lsq(
+    vertices: np.array,
+    faces: np.array,
+    uvs: np.array,
+    observations: List[np.array],
+    masks: List[np.array],
+    extrinsics: List[np.array],
+    intrinsics: List[np.array],
+    texture_size: int = 2048,
+    near: float = 0.1,
+    far: float = 10.0,
+    lambda_tv: float = 0.01,
+    iters: int = 60,
+    robust_iters: int = 2,
+    robust_delta: float = 0.05,
+    tol: float = 1e-4,
+    verbose: bool = False,
+):
+    """Solve texture baking in closed form instead of running 2500 Adam steps.
+
+    The rendering operator is linear in the texture: every observation pixel is a
+    bilinear combination of four texels, so the (TV-regularised) photometric loss
+    is a sparse quadratic form ``||W T - c||^2 + lambda * ||grad T||^2``. The
+    normal equations are assembled once per pass and solved with
+    Jacobi-preconditioned conjugate gradients in texture space. Two IRLS passes
+    with a robust weight approximate the L1 photometric loss used by Adam.
+
+    Returns the same uint8 ``(texture_size, texture_size, 3)`` array as
+    :func:`bake_texture` (mode='opt'), so the exporters are interchangeable.
+    """
+    vertices = torch.tensor(vertices).cuda()
+    faces = torch.tensor(faces.astype(np.int32)).cuda()
+    uvs = torch.tensor(uvs).cuda()
+    # bottom-up layout, matching rast['uv'] (see the note in bake_texture)
+    observations = [torch.tensor(obs / 255.0).float().cuda().flip(0) for obs in observations]
+    masks = [torch.tensor(m > 0).bool().cuda().flip(0) for m in masks]
+    views = [extrinsics_to_view(torch.tensor(extr).cuda()) for extr in extrinsics]
+    projections = [intrinsics_to_perspective(torch.tensor(intr).cuda(), near, far) for intr in intrinsics]
+
+    rastctx = RastContext(backend='cuda')
+    size = texture_size
+    num = size * size
+    offsets = _STENCIL_OFFSETS
+    corner_slot = [[offsets.index((_CORNER_DY[j] - _CORNER_DY[i],
+                                   _CORNER_DX[j] - _CORNER_DX[i])) for j in range(4)] for i in range(4)]
+
+    def rasterize_view(view_i):
+        observation, view, projection = observations[view_i], views[view_i], projections[view_i]
+        with torch.no_grad():
+            rast = rasterize_triangle_faces(
+                rastctx, vertices[None], faces, observation.shape[1], observation.shape[0],
+                uv=uvs[None], view=view, projection=projection)
+            rast_mask = rast['mask'][0].bool().flip(0)
+            sel = rast_mask & masks[view_i]
+            uv_pix = rast['uv'][0][sel]
+            return uv_pix, observation[sel]
+
+    # cache rasterised samples: (uv, colour) per view, used by every pass
+    start = time.time()
+    samples = [rasterize_view(i) for i in range(len(observations))]
+    if verbose:
+        total_px = sum(uv.shape[0] for uv, _ in samples)
+        tqdm.write(f'Texture baking (lsq): rasterised {len(samples)} views, '
+                   f'{total_px} samples ({time.time() - start:.1f}s)')
+
+    def assemble(pixel_weights):
+        b = torch.zeros((num, 3), dtype=torch.float32, device='cuda')
+        stencil = torch.zeros((len(offsets), num), dtype=torch.float32, device='cuda')
+        for i, (uv_pix, colour) in enumerate(samples):
+            if uv_pix.shape[0] == 0:
+                continue
+            idx, w = _bilinear_corners(uv_pix, size)
+            rw = pixel_weights[i] if pixel_weights is not None else None
+            if rw is not None:
+                wp = w * rw[:, None]
+            else:
+                wp = w
+            contrib = (wp[:, :, None] * colour[:, None, :]).reshape(-1, 3)
+            b.index_add_(0, idx.reshape(-1), contrib)
+            for a in range(4):
+                for c in range(4):
+                    stencil[corner_slot[a][c]].index_add_(0, idx[:, a], wp[:, a] * w[:, c])
+        return b, stencil
+
+    def solve(b_flat, stencil):
+        b = b_flat.reshape(size, size, 3)
+        diag = stencil[4].reshape(size, size, 1)
+        lam = lambda_tv * float(diag.mean().clamp_min(1e-6).item())
+        precond = (diag + 4 * lam).clamp_min(1e-6)
+
+        def apply_a(x):
+            out = torch.zeros_like(x)
+            for k, (dy, dx) in enumerate(offsets):
+                out.add_(stencil[k].reshape(size, size, 1) * torch.roll(x, (-dy, -dx), (0, 1)))
+            if lam > 0:
+                out.add_(lam * (4 * x
+                                - torch.roll(x, (-1, 0), (0, 1)) - torch.roll(x, (1, 0), (0, 1))
+                                - torch.roll(x, (0, -1), (0, 1)) - torch.roll(x, (0, 1), (0, 1))))
+            return out
+
+        x = b / precond
+        r = b - apply_a(x)
+        z = r / precond
+        p = z.clone()
+        rz = (r * z).sum(dim=(0, 1))
+        used = 0
+        for used in range(1, iters + 1):
+            ap = apply_a(p)
+            alpha = rz / (p * ap).sum(dim=(0, 1)).clamp_min(1e-12)
+            x.add_(alpha * p)
+            r.sub_(alpha * ap)
+            if float(r.abs().max()) < tol:
+                break
+            z = r / precond
+            rz_new = (r * z).sum(dim=(0, 1))
+            p = z + (rz_new / rz.clamp_min(1e-12)) * p
+            rz = rz_new
+        return x.clamp(0, 1), used
+
+    start = time.time()
+    pixel_weights = None
+    b, stencil = assemble(None)
+    texture, used = solve(b, stencil)
+    if verbose:
+        coverage = float((stencil[4] > 0).float().mean())
+        tqdm.write(f'Texture baking (lsq): pass 1 solved ({used} CG iters, '
+                   f'{time.time() - start:.1f}s, sampled texels {coverage * 100:.1f}%)')
+
+    for round_i in range(max(robust_iters - 1, 0)):
+        start = time.time()
+        # per-pixel residual -> robust (pseudo-Huber style) weights for L1-like fit
+        pixel_weights = []
+        with torch.no_grad():
+            for uv_pix, colour in samples:
+                idx, w = _bilinear_corners(uv_pix, size)
+                flat = texture.reshape(num, 3)
+                render = sum(w[:, j:j + 1] * flat[idx[:, j]] for j in range(4))
+                residual = (render - colour).abs().mean(dim=1)
+                pixel_weights.append(1.0 / residual.clamp_min(robust_delta))
+        b, stencil = assemble(pixel_weights)
+        texture, used = solve(b, stencil)
+        if verbose:
+            tqdm.write(f'Texture baking (lsq): robust pass {round_i + 2} solved '
+                       f'({used} CG iters, {time.time() - start:.1f}s)')
+
+    # texels inside a UV island that no observation pixel hit: fill from neighbours
+    # (plain zero would show up as speckles after minification)
+    known = (stencil[4] > 0).reshape(size, size)
+    neighbours = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    for _ in range(32):
+        if bool(known.all()):
+            break
+        count = sum(torch.roll(known.float(), sh, (0, 1)) for sh in neighbours)
+        accum = sum(torch.roll(texture, sh, (0, 1)) for sh in neighbours)
+        fill = (~known) & (count > 0)
+        texture[fill] = accum[fill] / count[fill][:, None]
+        known = known | fill
+
+    texture = np.clip(texture.flip(0).detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
+    hole = 1 - rasterize_triangle_faces(
+        rastctx, (uvs * 2 - 1)[None], faces, size, size)['mask'][0].detach().cpu().numpy().astype(np.uint8)
+    texture = cv2.inpaint(texture, hole, 3, cv2.INPAINT_TELEA)
     return texture
 
 

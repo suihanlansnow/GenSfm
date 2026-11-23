@@ -55,7 +55,7 @@ class MeshExtractResult:
 
 
 class SparseFeatures2Mesh:
-    def __init__(self, device="cuda", res=64, use_color=True):
+    def __init__(self, device="cuda", res=64, use_color=True, crop_to_active=True):
         '''
         a model to generate a mesh from sparse features structures using flexicube
         '''
@@ -64,11 +64,40 @@ class SparseFeatures2Mesh:
         self.res = res
         self.mesh_extractor = FlexiCubes(device=device)
         self.sdf_bias = -1.0 / res
-        verts, cube = construct_dense_grid(self.res, self.device)
-        self.reg_c = cube.to(self.device)
-        self.reg_v = verts.to(self.device)
+        self.crop_to_active = crop_to_active
+        if not crop_to_active:
+            verts, cube = construct_dense_grid(self.res, self.device)
+            self.reg_c = cube.to(self.device)
+            self.reg_v = verts.to(self.device)
         self.use_color = use_color
         self._calc_layout()
+
+    def _cropped_grid(self, coords):
+        """Dense grid restricted to the active voxel bounding box (+1 cube margin).
+
+        Outside the crop every corner has the default SDF value, so no surface can
+        exist there; the extracted mesh is identical to the full 257^3 evaluation.
+        """
+        lo = (coords.min(0).values - 1).clamp(min=0)
+        hi = (coords.max(0).values + 2).clamp(max=self.res)
+        dims = [int(hi[i] - lo[i]) for i in range(3)]
+        vdims = [d + 1 for d in dims]
+        axes = [torch.arange(int(lo[i]), int(hi[i]) + 1, device=coords.device) for i in range(3)]
+        verts = torch.stack(torch.meshgrid(*axes, indexing='ij'), dim=-1).reshape(-1, 3)
+        vid = torch.arange(vdims[0] * vdims[1] * vdims[2], device=coords.device).reshape(vdims)
+        bias = (cube_corners[:, 0] * vdims[1] + cube_corners[:, 1]) * vdims[2] + cube_corners[:, 2]
+        bias = bias.to(coords.device)
+        cubes = vid[:dims[0], :dims[1], :dims[2]].reshape(-1, 1) + bias
+        return lo, dims, verts, cubes
+
+    @staticmethod
+    def _scatter_dense(idx, values, shape, sdf_init):
+        F = values.shape[-1]
+        out = torch.zeros(list(shape) + [F], device=values.device)
+        if sdf_init:
+            out[..., 0] = 1
+        out[idx[:, 0], idx[:, 1], idx[:, 2], :] = values
+        return out.reshape(-1, F)
     
     def _calc_layout(self):
         LAYOUTS = {
@@ -110,21 +139,28 @@ class SparseFeatures2Mesh:
         sdf += self.sdf_bias
         v_attrs = [sdf, deform, color] if self.use_color else [sdf, deform]
         v_pos, v_attrs, reg_loss = sparse_cube2verts(coords, torch.cat(v_attrs, dim=-1), training=training)
-        v_attrs_d = get_dense_attrs(v_pos, v_attrs, res=self.res+1, sdf_init=True)
-        weights_d = get_dense_attrs(coords, weights, res=self.res, sdf_init=False)
+        if self.crop_to_active:
+            lo, dims, reg_v, reg_c = self._cropped_grid(coords)
+            v_attrs_d = self._scatter_dense((v_pos - lo).long(), v_attrs, [d + 1 for d in dims], True)
+            weights_d = self._scatter_dense((coords - lo).long(), weights, dims, False)
+            resolution = dims
+        else:
+            v_attrs_d = get_dense_attrs(v_pos, v_attrs, res=self.res+1, sdf_init=True)
+            weights_d = get_dense_attrs(coords, weights, res=self.res, sdf_init=False)
+            reg_v, reg_c, resolution = self.reg_v, self.reg_c, self.res
         if self.use_color:
             sdf_d, deform_d, colors_d = v_attrs_d[..., 0], v_attrs_d[..., 1:4], v_attrs_d[..., 4:]
         else:
             sdf_d, deform_d = v_attrs_d[..., 0], v_attrs_d[..., 1:4]
             colors_d = None
             
-        x_nx3 = get_defomed_verts(self.reg_v, deform_d, self.res)
+        x_nx3 = get_defomed_verts(reg_v, deform_d, self.res)
         
         vertices, faces, L_dev, colors = self.mesh_extractor(
             voxelgrid_vertices=x_nx3,
             scalar_field=sdf_d,
-            cube_idx=self.reg_c,
-            resolution=self.res,
+            cube_idx=reg_c,
+            resolution=resolution,
             beta=weights_d[:, :12],
             alpha=weights_d[:, 12:20],
             gamma_f=weights_d[:, 20],
