@@ -87,3 +87,7 @@ paper/
 # Local validation scripts are not part of the source repository
 /tests/
 /Tests/
+
+# Local scratch scripts/logs and input data
+.tmp_dl/
+data/
