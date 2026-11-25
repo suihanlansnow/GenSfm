@@ -187,6 +187,19 @@ Total: **224 s → 120 s** for a 4-view, 3-seed run (excluding model loading).
 
 Cropped extraction and key-based dedup are on by default. `to_glb` keeps upstream's `bake_texture(mode='opt')`; the closed-form path is opt-in and typically faster.
 
+### Measured trade-offs (not enabled by default)
+
+Same mesh, UVs and cameras; 10 held-out views rendered at 768² with mipmapping and compared against the 2048²/160-view bake:
+
+| Bake config | Time | Difference vs baseline | Verdict |
+| --- | --- | --- | --- |
+| 2048², 160 views (current) | 9.4 s | baseline | keep |
+| 1024², 160 views | 6.4 s | 49.4 dB (imperceptible) | safe to switch, saves 3.0 s |
+| 2048², 96 views | 7.6 s | 28.7 dB (visible) | rejected |
+| 1024², 96 views | 4.0 s | 32.0 dB (visible) | rejected |
+
+Denoising steps 25 → 20 (same seed): silhouette IoU 0.9055 → 0.8939, 32.9 s → 31.0 s — rejected, the gain is too small for the quality loss.
+
 Considered and rejected: screening the 3 seeds on stage 1 (projecting the SSUV occupancy as a silhouette proxy) would save ~35 s, but the proxy ranked the seeds differently from the final Gaussian IoU (`proxy pick 3 / final pick 2`), so it is not enabled.
 
 ## 本仓库目的与工程优化
@@ -216,6 +229,19 @@ Considered and rejected: screening the 3 seeds on stage 1 (projecting the SSUV o
 ![性能对比](assets/optimization/performance-comparison.png)
 
 裁剪提取与键去重已默认开启。`to_glb` 仍保留上游的 `bake_texture(mode='opt')`；闭式烘焙需显式调用，通常更快。
+
+### 实测取舍项（未启用为默认）
+
+同一网格、UV 与相机；10 个留出视角在 768² 下以 mipmap 渲染，与 2048²/160 视角基准对比：
+
+| 烘焙配置 | 耗时 | 与基准渲染差异 | 结论 |
+| --- | --- | --- | --- |
+| 2048²，160 视角（当前） | 9.4 s | 基准 | 保留 |
+| 1024²，160 视角 | 6.4 s | 49.4 dB（肉眼无差别） | 可切换，省 3.0 s |
+| 2048²，96 视角 | 7.6 s | 28.7 dB（可见差异） | 不采用 |
+| 1024²，96 视角 | 4.0 s | 32.0 dB（可见差异） | 不采用 |
+
+去噪步数 25 → 20（同一 seed）：轮廓 IoU 0.9055 → 0.8939，单 seed 32.9 s → 31.0 s —— 收益太小、质量有损，不采用。
 
 已验证但**不采用**：用 stage1 的 SSUV 占用投影做种子预筛可省约 35 s，但代理排序与最终 Gaussian IoU 不一致（`proxy pick 3 / final pick 2`），因此没有启用。
 
