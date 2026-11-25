@@ -455,9 +455,15 @@ class FlowMatchingEvaluator(FlowMatchingCoreMixin, AlignmentMixin, Evaluator):
 
         use_known_k = self.use_gt_intrinsics and intrinsics_gt is not None
 
-        extrinsics_list = []
-        intrinsics_list = []
-        reproj_list = []
+        # 每个视角的有效体素可能有数万，SVD 做 (2N × 12) 分解成本随 N 线性增长。
+        # DLT 本身的最小冗余要求只有 6 对，超过约 8k 点后解的精度已经不再明显提升。
+        # 因此这里对每个视角做有放回随机下采样到固定上限，既大幅加速 SVD，
+        # 也避免个别视角因有效体素过多成为瓶颈。
+        MAX_POINTS_PER_VIEW = 8192
+
+        xyz_batched = []
+        uv_batched = []
+        K_known_batched = []
         for i in range(uv_voxels.shape[0]):
             valid_voxel = (voxel_weights[i] > 0)
             if self.dilation_sigma > 0:
@@ -466,20 +472,24 @@ class FlowMatchingEvaluator(FlowMatchingCoreMixin, AlignmentMixin, Evaluator):
                     sigma=self.dilation_sigma,
                     min_weight=self.dilation_min_weight,
                 ).flatten()
-            xyzs = xyz_voxels[:, :, valid_voxel].permute(0, 2, 1).contiguous()
-            uvs = uv_voxels[i:i+1, :, valid_voxel].permute(0, 2, 1).contiguous()
+            idx = torch.nonzero(valid_voxel, as_tuple=False).flatten()
+            n = idx.shape[0]
+            if n > MAX_POINTS_PER_VIEW:
+                idx = idx[torch.randperm(n, device=idx.device)[:MAX_POINTS_PER_VIEW]]
+            xyz_batched.append(xyz_voxels[:, :, idx].permute(0, 2, 1).contiguous())
+            uv_batched.append(uv_voxels[i:i+1, :, idx].permute(0, 2, 1).contiguous())
             if use_known_k:
-                K = intrinsics_gt[i:i+1]
-                RT, RE = solve_pnp_known_k(xyzs, uvs, K)
-            else:
-                K, RT, RE = calibrate_camera_dlt(xyzs, uvs)
-            intrinsics_list.append(K)
-            extrinsics_list.append(RT)
-            reproj_list.append(RE)
+                K_known_batched.append(intrinsics_gt[i:i+1])
 
-        extrinsics = torch.concat(extrinsics_list, dim=0)
-        intrinsics = torch.concat(intrinsics_list, dim=0)
-        reproj = torch.stack(reproj_list)
+        xyz_b = torch.cat(xyz_batched, dim=0)
+        uv_b = torch.cat(uv_batched, dim=0)
+
+        if use_known_k:
+            K_b = torch.cat(K_known_batched, dim=0)
+            extrinsics, reproj = solve_pnp_known_k(xyz_b, uv_b, K_b)
+            intrinsics = K_b
+        else:
+            intrinsics, extrinsics, reproj = calibrate_camera_dlt(xyz_b, uv_b)
         # Extend to 4x4 homogeneous extrinsics
         pad_row = extrinsics.new_zeros(extrinsics.shape[0], 1, 4)
         pad_row[:, 0, 3] = 1.0
