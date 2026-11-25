@@ -101,7 +101,7 @@ def source_intrinsics(intrinsics, records):
     return result
 
 
-def reconstruct(evaluator, inputs, seed):
+def _seed_everything(seed):
     import numpy as np
     import torch
 
@@ -109,7 +109,20 @@ def reconstruct(evaluator, inputs, seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    condition = inputs.condition[None].to(evaluator.device)
+
+
+def reconstruct_stage1(evaluator, inputs=None, seed=None, condition=None):
+    """Stage 1 only: sample the joint shape/camera latent and solve the cameras.
+
+    Returns ``(ssuv, extrinsics, intrinsics)``. Splitting the two stages lets a
+    caller screen several seeds on stage 1 and pay for stage 2 only once.
+    """
+    import torch
+
+    if seed is not None:
+        _seed_everything(seed)
+    if condition is None:
+        condition = inputs.condition[None].to(evaluator.device)
     with torch.no_grad():
         print('Stage 1: joint shape and camera generation', flush=True)
         ssuv, _ = evaluator._sample_ssuv(cond=condition)
@@ -119,12 +132,28 @@ def reconstruct(evaluator, inputs, seed):
             raise RuntimeError('Non-finite predicted camera parameters')
         if not (intrinsics[:, 0, 0] > 0).all() or not (intrinsics[:, 1, 1] > 0).all():
             raise RuntimeError('Predicted focal lengths must be positive')
+    return ssuv, extrinsics, intrinsics
+
+
+def reconstruct_stage2(evaluator, condition, ssuv, extrinsics, intrinsics):
+    """Stage 2 only: appearance/detail latent sampling from a stage-1 result."""
+    import torch
+
+    with torch.no_grad():
         noise = evaluator._make_randn_sparse_latent_from_ss(ssuv['ss_recon'])
         if len(noise.coords) == 0:
             raise RuntimeError('The model predicted no occupied voxels')
         uvs = evaluator._make_sparse_uvs_from_pose(noise, extrinsics[None], intrinsics[None])
         print('Stage 2: appearance and detailed geometry generation', flush=True)
         outputs = evaluator._sample_slat(cond=condition, noise=noise, uvs=uvs)
+    return outputs
+
+
+def reconstruct(evaluator, inputs, seed):
+    condition = inputs.condition[None].to(evaluator.device)
+    ssuv, extrinsics, intrinsics = reconstruct_stage1(
+        evaluator, condition=condition, seed=seed)
+    outputs = reconstruct_stage2(evaluator, condition, ssuv, extrinsics, intrinsics)
     return outputs, extrinsics, intrinsics
 
 

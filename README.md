@@ -178,12 +178,16 @@ Three rules:
 | Per-seed camera solve (4× DLT SVD) | per-view subsample to ~8k valid voxels + batch all 4 views into one SVD call | **7×** | silhouette IoU unchanged across seeds |
 | Bake pass 2 CG | warm start from pass 1 + every-5-step tol check + cap iters at 40 | incremental | pass residual < 1e-4, no quality change |
 | Hole fill (8 rounds vs 32) | `solve()` already spreads values via TV regularization; residual propagation has diminishing returns after 8 rounds | incremental | no visible speckles, same postprocess mesh |
+| Texture bake uv stencil | compute the bilinear corner index/weight once per view instead of in every pass | incremental | baked atlas identical (max diff 3/255, 0.00% pixels) |
+| Checkpoint loading | single-process loads use `mmap` + CPU parse instead of buffering the whole file | 58 s → 46 s cold start | same tensors, bit-identical weights |
 
 Total: **224 s → 120 s** for a 4-view, 3-seed run (excluding model loading).
 
 ![Performance comparison](assets/optimization/performance-comparison.png)
 
 Cropped extraction and key-based dedup are on by default. `to_glb` keeps upstream's `bake_texture(mode='opt')`; the closed-form path is opt-in and typically faster.
+
+Considered and rejected: screening the 3 seeds on stage 1 (projecting the SSUV occupancy as a silhouette proxy) would save ~35 s, but the proxy ranked the seeds differently from the final Gaussian IoU (`proxy pick 3 / final pick 2`), so it is not enabled.
 
 ## 本仓库目的与工程优化
 
@@ -204,12 +208,16 @@ Cropped extraction and key-based dedup are on by default. `to_glb` keeps upstrea
 | 每 seed 相机求解（4× DLT SVD） | 每视角下采样到 ~8k 有效体素 + 4 视角 batched SVD | **7×** | 各 seed 轮廓 IoU 无变化 |
 | 烘焙 pass 2 CG | 用 pass 1 解作初值 + 每 5 步 tol 检查 + iters 上限 40 | 小幅 | pass 残差 < 1e-4，质量无变化 |
 | 补洞 8 轮（替代 32 轮） | `solve()` 已通过 TV 正则扩散了一层值，8 轮后蔓延递减 | 小幅 | 无可见麻点，后处理网格一致 |
+| 烘焙双线性采样 | 每个视角只算一次角点索引/权重，供所有 pass 复用 | 小幅 | 贴图完全一致（最大差 3/255，0.00% 像素不同） |
+| 权重加载 | 单进程改用 `mmap` + CPU 解析，不再把整个 ckpt 读进缓冲区 | 冷启动 58 s → 46 s | 张量一致，权重逐位相同 |
 
 4 视角、3 seed 场景，不含模型加载：**224 s → 120 s**。
 
 ![性能对比](assets/optimization/performance-comparison.png)
 
 裁剪提取与键去重已默认开启。`to_glb` 仍保留上游的 `bake_texture(mode='opt')`；闭式烘焙需显式调用，通常更快。
+
+已验证但**不采用**：用 stage1 的 SSUV 占用投影做种子预筛可省约 35 s，但代理排序与最终 Gaussian IoU 不一致（`proxy pick 3 / final pick 2`），因此没有启用。
 
 ## Citation
 

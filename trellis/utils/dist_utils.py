@@ -59,16 +59,32 @@ def load_ckpt_dist(path, map_location=None):
         if map_location is not None:
             for k, v in model_ckpt.items():
                 model_ckpt[k] = v.to(map_location)
-    else:
-        ckpt_bytes = read_bytes_dist(path)
+        return model_ckpt
+
+    single_process = not dist.is_initialized() or dist.get_world_size() <= 1
+    if single_process:
+        # Reading the checkpoint into a bytes buffer costs an extra full copy of
+        # the file before torch parses it. mmap decodes lazily and produces the
+        # exact same tensors, then they are moved to ``map_location`` as before.
         try:
-            # First try with weights_only=True for security
-            model_ckpt = torch.load(io.BytesIO(ckpt_bytes), map_location=map_location, weights_only=True)
+            model_ckpt = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
         except Exception as e:
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                print(f'Warning: Failed to load {path} with weights_only=True, retrying with weights_only=False: {e}')
-            # Fallback to weights_only=False if the file contains non-standard objects
-            model_ckpt = torch.load(io.BytesIO(ckpt_bytes), map_location=map_location, weights_only=False)
+            print(f'Warning: mmap load of {path} failed ({e}); falling back to buffered load')
+        else:
+            if map_location is not None:
+                model_ckpt = {k: v.to(map_location) if torch.is_tensor(v) else v
+                              for k, v in model_ckpt.items()}
+            return model_ckpt
+
+    ckpt_bytes = read_bytes_dist(path)
+    try:
+        # First try with weights_only=True for security
+        model_ckpt = torch.load(io.BytesIO(ckpt_bytes), map_location=map_location, weights_only=True)
+    except Exception as e:
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f'Warning: Failed to load {path} with weights_only=True, retrying with weights_only=False: {e}')
+        # Fallback to weights_only=False if the file contains non-standard objects
+        model_ckpt = torch.load(io.BytesIO(ckpt_bytes), map_location=map_location, weights_only=False)
     return model_ckpt
 
 

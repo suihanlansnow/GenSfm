@@ -880,23 +880,25 @@ def bake_texture_lsq(
             rast_mask = rast['mask'][0].bool().flip(0)
             sel = rast_mask & masks[view_i]
             uv_pix = rast['uv'][0][sel]
-            return uv_pix, observation[sel]
+            # the bilinear stencil only depends on uv, so compute it once and reuse
+            # it across the initial solve and every robust pass
+            idx, w = _bilinear_corners(uv_pix, size)
+            return observation[sel], idx, w
 
-    # cache rasterised samples: (uv, colour) per view, used by every pass
+    # cache rasterised samples: (colour, corner index, corner weight) per view
     start = time.time()
     samples = [rasterize_view(i) for i in range(len(observations))]
     if verbose:
-        total_px = sum(uv.shape[0] for uv, _ in samples)
+        total_px = sum(idx.shape[0] for _, idx, _ in samples)
         tqdm.write(f'Texture baking (lsq): rasterised {len(samples)} views, '
                    f'{total_px} samples ({time.time() - start:.1f}s)')
 
     def assemble(pixel_weights):
         b = torch.zeros((num, 3), dtype=torch.float32, device='cuda')
         stencil = torch.zeros((len(offsets), num), dtype=torch.float32, device='cuda')
-        for i, (uv_pix, colour) in enumerate(samples):
-            if uv_pix.shape[0] == 0:
+        for i, (colour, idx, w) in enumerate(samples):
+            if idx.shape[0] == 0:
                 continue
-            idx, w = _bilinear_corners(uv_pix, size)
             rw = pixel_weights[i] if pixel_weights is not None else None
             if rw is not None:
                 wp = w * rw[:, None]
@@ -958,9 +960,8 @@ def bake_texture_lsq(
         # per-pixel residual -> robust (pseudo-Huber style) weights for L1-like fit
         pixel_weights = []
         with torch.no_grad():
-            for uv_pix, colour in samples:
-                idx, w = _bilinear_corners(uv_pix, size)
-                flat = texture.reshape(num, 3)
+            flat = texture.reshape(num, 3)
+            for colour, idx, w in samples:
                 render = sum(w[:, j:j + 1] * flat[idx[:, j]] for j in range(4))
                 residual = (render - colour).abs().mean(dim=1)
                 pixel_weights.append(1.0 / residual.clamp_min(robust_delta))
@@ -977,6 +978,7 @@ def bake_texture_lsq(
     # 实测 32 轮后半已基本不再推进，省掉纯浪费的 roll 开销。
     known = (stencil[4] > 0).reshape(size, size)
     neighbours = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    fill_start = time.time()
     for _ in range(8):
         if bool(known.all()):
             break
@@ -989,7 +991,11 @@ def bake_texture_lsq(
     texture = np.clip(texture.flip(0).detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
     hole = 1 - rasterize_triangle_faces(
         rastctx, (uvs * 2 - 1)[None], faces, size, size)['mask'][0].detach().cpu().numpy().astype(np.uint8)
+    fill_time = time.time() - fill_start
     texture = cv2.inpaint(texture, hole, 3, cv2.INPAINT_TELEA)
+    if verbose:
+        tqdm.write(f'Texture baking (lsq): fill {fill_time:.1f}s, '
+                   f'inpaint {time.time() - fill_start - fill_time:.1f}s')
     return texture
 
 
