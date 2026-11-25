@@ -67,6 +67,9 @@ assets/example/spongebob/*
 !assets/example/floral-teapot/
 assets/example/floral-teapot/*
 !assets/example/floral-teapot/0[0-3].png
+!assets/optimization/
+assets/optimization/*
+!assets/optimization/performance-comparison.png
 figures
 MoGe
 *.slurm
